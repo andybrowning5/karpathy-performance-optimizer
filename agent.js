@@ -1,13 +1,11 @@
 /**
- * Performance Optimizer — autonomous code performance agent (Deep Agent, Node.js).
+ * Performance Optimizer — Karpathy-style iterative agent.
  *
- * Uses deepagentsjs with LocalShellBackend to:
- * 1. Explore a codebase and run baseline benchmarks
- * 2. Identify performance bottlenecks (O(n^2), redundant work, etc.)
- * 3. Implement optimizations one at a time
- * 4. Verify with tests — keep if they pass, revert if they don't
+ * Conversational + autonomous. Answers questions naturally.
+ * When asked to optimize, enters an iterative loop:
+ * edit → test → keep/revert → report → next.
  *
- * Runs via the Primordial NDJSON protocol (stdin/stdout) or standalone.
+ * Streams tool uses back to the host for Claude Code-style logging.
  */
 import { createDeepAgent, LocalShellBackend } from "deepagents";
 import { ChatAnthropic } from "@langchain/anthropic";
@@ -16,48 +14,35 @@ import { createInterface } from "readline";
 
 const WORKSPACE = process.env.WORKSPACE || process.cwd();
 
-const SYSTEM_PROMPT = `You are the Performance Optimizer, an autonomous agent that improves code performance.
+const SYSTEM_PROMPT = `You are the Performance Optimizer. You live in a workspace at ${WORKSPACE}.
 
-## Your Mission
-Given a codebase with performance tests, find and fix performance bottlenecks.
-Make the failing performance tests pass while keeping all correctness tests green.
+## Personality
+You are conversational. If the user asks a question, answer it directly. If they ask you to look at something, look at it and tell them what you see. Only enter the optimization loop when explicitly asked to optimize, improve performance, or fix slow code.
 
-## Workflow
+## Optimization Loop
+When asked to optimize, work like an autonomous researcher:
 
-1. **Explore** — Use ls, read_file, glob, grep to understand the codebase structure.
-2. **Baseline** — Run the test suite with \`execute\` to see which tests pass/fail.
-   Use: \`python -m pytest -v 2>&1\` to run all tests.
-3. **Analyze** — Read the failing performance tests to understand what they measure.
-   Read the source code to identify the algorithmic bottleneck.
-4. **Plan** — Use write_todos to track which functions need optimization and what algorithm to use.
-5. **For each optimization:**
-   a. Read the function you want to optimize.
-   b. Implement ONE focused optimization (e.g., replace O(n^2) with O(n) using a set/dict).
-   c. Run correctness tests: \`python -m pytest test_correctness.py -v 2>&1\`
-   d. If correctness passes, run performance tests: \`python -m pytest test_performance.py -v 2>&1\`
-   e. If BOTH pass: commit with \`git add -A && git commit -m "opt: description"\`.
-   f. If EITHER fails: revert with \`git checkout -- .\` and try a different approach.
-   g. Update your todos with the result.
+LOOP until all performance tests pass or you run out of ideas:
+1. Explore the codebase — ls, read_file, glob, grep
+2. Run the full test suite to see the baseline: \`python -m pytest -v 2>&1\`
+3. Pick ONE slow function to optimize
+4. Read it, identify the bottleneck, implement a focused fix
+5. Run correctness tests: \`python -m pytest test_correctness.py -v 2>&1\`
+6. If correctness FAILS → \`git checkout -- .\` and try a different approach
+7. Run performance tests: \`python -m pytest test_performance.py -v 2>&1\`
+8. If perf FAILS → \`git checkout -- .\` and try a different approach
+9. If BOTH PASS → \`git add -A && git commit -m "opt: description"\`
+10. Report what you optimized, the technique, and the speedup
+11. Move to the next slow function — don't stop, don't ask
 
 ## Rules
-- Fix ONE function per iteration. Don't batch changes.
-- Always run correctness tests BEFORE performance tests.
-- If a correctness test fails, your optimization is WRONG — revert immediately.
-- Use edit_file for surgical changes (preferred). Only use write_file for new files.
-- Always read a file before editing it.
-- Common optimizations:
-  - O(n^2) membership check → use a set for O(1) lookups
-  - O(n^2) counting → use a dict/Counter for O(n) counting
-  - Repeated list concatenation → use list.append() or list.extend()
-  - Recomputing sums → use sliding window
-  - Sorting when merging → use two-pointer merge
-- When all performance tests pass, summarize what you optimized and the speedups.
-- If a function is already fast enough, skip it.
-
-## Important
-- The workspace is at ${WORKSPACE}
-- Python is available via \`python\` or \`python3\`
-- Use \`git\` to track changes and enable easy reverts`;
+- ONE function per iteration. Never batch changes.
+- Always test correctness BEFORE performance.
+- If correctness fails, your change is WRONG — revert immediately.
+- Read files before editing them. Use edit_file for surgical changes.
+- When all tests pass, give a final summary table with before/after/speedup.
+- Python is \`python\` or \`python3\`. Git is available.
+- NEVER STOP to ask "should I continue?" — keep going until done.`;
 
 // --- NDJSON Protocol ---
 
@@ -65,174 +50,202 @@ function send(msg) {
   process.stdout.write(JSON.stringify(msg) + "\n");
 }
 
-function waitForMessage() {
-  return new Promise((resolve) => {
-    let resolved = false;
-    const rl = createInterface({ input: process.stdin });
-    rl.on("line", (line) => {
+// --- Persistent stdin reader for multi-turn ---
+
+class MessageReader {
+  constructor() {
+    this._rl = createInterface({ input: process.stdin });
+    this._queue = [];
+    this._resolve = null;
+    this._closed = false;
+
+    this._rl.on("line", (line) => {
       line = line.trim();
-      if (!line || resolved) return;
+      if (!line) return;
       try {
         const msg = JSON.parse(line);
-        resolved = true;
-        rl.close();
-        resolve(msg.type === "shutdown" ? null : msg);
-      } catch {
-        // ignore malformed lines
-      }
+        if (msg.type === "shutdown") {
+          this._closed = true;
+          if (this._resolve) { this._resolve(null); this._resolve = null; }
+          this._rl.close();
+          return;
+        }
+        if (this._resolve) {
+          const r = this._resolve;
+          this._resolve = null;
+          r(msg);
+        } else {
+          this._queue.push(msg);
+        }
+      } catch { /* ignore malformed */ }
     });
-    rl.on("close", () => {
-      if (!resolved) resolve(null);
+
+    this._rl.on("close", () => {
+      this._closed = true;
+      if (this._resolve) { this._resolve(null); this._resolve = null; }
     });
-  });
-}
-
-function parseObjective(content) {
-  let objective = content;
-  let verifyCmd = "python -m pytest -v 2>&1";
-
-  if (content.includes("|")) {
-    const [obj, rest] = content.split("|", 2);
-    objective = obj.trim();
-    const verify = rest.trim();
-    verifyCmd = verify.toLowerCase().startsWith("verify:")
-      ? verify.slice(7).trim()
-      : verify;
   }
 
-  return { objective, verifyCmd };
+  next() {
+    if (this._queue.length > 0) return Promise.resolve(this._queue.shift());
+    if (this._closed) return Promise.resolve(null);
+    return new Promise((resolve) => { this._resolve = resolve; });
+  }
 }
 
-async function runAgent(objective, verifyCmd, onActivity) {
-  if (onActivity) onActivity("Creating backend...");
+// --- Tool activity summarizer ---
 
-  const backend = await LocalShellBackend.create({
+function summarizeTool(name, input) {
+  if (!input) return name;
+  if (name === "read_file") return `read ${input.path || ""}`;
+  if (name === "write_file") return `write ${input.path || ""}`;
+  if (name === "edit_file") return `edit ${input.path || ""}`;
+  if (name === "execute") return `$ ${(input.command || "").slice(0, 120)}`;
+  if (name === "ls") return `ls ${input.path || "."}`;
+  if (name === "glob") return `glob ${input.pattern || ""}`;
+  if (name === "grep") return `grep ${input.pattern || ""}`;
+  if (name === "write_todos") return "update todos";
+  return name;
+}
+
+// --- Agent (created once, reused across messages) ---
+
+let backend = null;
+let agent = null;
+
+async function ensureAgent() {
+  if (agent) return agent;
+
+  backend = await LocalShellBackend.create({
     rootDir: WORKSPACE,
     virtualMode: false,
     inheritEnv: true,
     timeout: 120,
   });
 
-  if (onActivity) onActivity("Creating deep agent...");
-
-  const agent = createDeepAgent({
-    model: new ChatAnthropic({
-      model: "claude-opus-4-6",
-      temperature: 0,
-    }),
+  agent = createDeepAgent({
+    model: new ChatAnthropic({ model: "claude-opus-4-6", temperature: 0 }),
     systemPrompt: SYSTEM_PROMPT,
     backend,
   });
 
-  const task = [
-    `## Objective`,
-    objective,
-    ``,
-    `## Verify Command`,
-    `\`${verifyCmd}\``,
-    ``,
-    `## Workspace`,
-    WORKSPACE,
-    ``,
-    `Start by exploring the workspace and running the full test suite to see`,
-    `the baseline. Then optimize each failing function one at a time, verifying`,
-    `after each change.`,
-  ].join("\n");
+  return agent;
+}
 
-  if (onActivity) onActivity("Invoking agent (this takes several minutes)...");
+async function handleMessage(content, onActivity) {
+  const ag = await ensureAgent();
 
-  // Use invoke with a heartbeat timer to keep the connection alive
-  let heartbeatCount = 0;
-  const heartbeat = setInterval(() => {
-    heartbeatCount++;
-    if (onActivity) onActivity(`Agent working... (${heartbeatCount * 30}s)`);
-  }, 30_000);
+  // Stream events for tool-use logging (Claude Code-style)
+  let finalContent = "";
 
   try {
-    const result = await agent.invoke(
-      { messages: [new HumanMessage(task)] },
-      { recursionLimit: 200 }
+    const eventStream = ag.streamEvents(
+      { messages: [new HumanMessage(content)] },
+      { version: "v2", recursionLimit: 200 }
     );
 
-    const messages = result.messages || [];
-    if (messages.length > 0) {
-      const last = messages[messages.length - 1];
-      if (last.content) {
-        return typeof last.content === "string"
-          ? last.content
-          : JSON.stringify(last.content);
+    for await (const event of eventStream) {
+      // Tool calls → activity events
+      if (event.event === "on_tool_start") {
+        const toolName = event.name || "tool";
+        const input = event.data?.input || {};
+        const desc = summarizeTool(toolName, input);
+        onActivity(toolName, desc);
+      }
+
+      // Capture final response from the graph
+      if (event.event === "on_chain_end" && event.name === "LangGraph") {
+        const output = event.data?.output;
+        if (output?.messages?.length) {
+          const last = output.messages[output.messages.length - 1];
+          if (last.content) {
+            finalContent = typeof last.content === "string"
+              ? last.content
+              : JSON.stringify(last.content);
+          }
+        }
       }
     }
-    return "Agent completed with no final message.";
-  } finally {
-    clearInterval(heartbeat);
+  } catch (err) {
+    // Fallback: if streamEvents isn't supported, use invoke
+    if (err.message?.includes("streamEvents") || err.message?.includes("not a function")) {
+      onActivity("agent", "Streaming not available, using invoke...");
+      const result = await ag.invoke(
+        { messages: [new HumanMessage(content)] },
+        { recursionLimit: 200 }
+      );
+      const messages = result.messages || [];
+      if (messages.length > 0) {
+        const last = messages[messages.length - 1];
+        if (last.content) {
+          finalContent = typeof last.content === "string"
+            ? last.content
+            : JSON.stringify(last.content);
+        }
+      }
+    } else {
+      throw err;
+    }
   }
+
+  return finalContent || "Agent completed.";
 }
 
 // --- Entry Points ---
 
 async function runPrimordial() {
+  const reader = new MessageReader();
   send({ type: "ready" });
 
-  const msg = await waitForMessage();
-  if (!msg) process.exit(0);
+  // Multi-turn conversation loop
+  while (true) {
+    const msg = await reader.next();
+    if (!msg) break;
 
-  const mid = msg.message_id || "";
-  const content = msg.content || "";
-  const { objective, verifyCmd } = parseObjective(content);
+    const mid = msg.message_id || "";
+    const content = msg.content || "";
 
-  send({
-    type: "activity",
-    tool: "setup",
-    description: `Starting performance optimization: ${objective}`,
-  });
+    try {
+      const result = await handleMessage(content, (tool, desc) => {
+        send({ type: "activity", tool, description: desc, message_id: mid });
+      });
 
-  try {
-    const result = await runAgent(objective, verifyCmd, (desc) => {
-      send({ type: "activity", tool: "agent", description: desc });
-    });
-
-    send({
-      type: "response",
-      content: result,
-      message_id: mid,
-      done: true,
-    });
-  } catch (err) {
-    send({
-      type: "error",
-      error: `Agent failed: ${err.message || err}`,
-      message_id: mid,
-    });
+      send({
+        type: "response",
+        content: result,
+        message_id: mid,
+        done: true,
+      });
+    } catch (err) {
+      send({
+        type: "error",
+        error: `Agent failed: ${err.message || err}`,
+        message_id: mid,
+      });
+    }
   }
 }
 
 async function runStandalone() {
-  const args = process.argv.slice(2);
-  if (args.length === 0) {
-    console.log(
-      "Usage: node agent.js 'optimize performance | verify: python -m pytest -v'"
-    );
+  const content = process.argv.slice(2).join(" ");
+  if (!content) {
+    console.log("Usage: node agent.js 'optimize the code'");
     process.exit(1);
   }
 
-  const content = args.join(" ");
-  const { objective, verifyCmd } = parseObjective(content);
-  const result = await runAgent(objective, verifyCmd, (desc) => {
-    console.error(`  > ${desc}`);
+  console.error("Starting agent...");
+  const result = await handleMessage(content, (tool, desc) => {
+    console.error(`  › ${desc}`);
   });
-  console.log("\n=== Result ===\n");
-  console.log(result);
+  console.log("\n" + result);
 }
 
 // Detect mode
 if (process.argv.length > 2) {
   runStandalone().catch(console.error);
 } else if (process.stdin.isTTY) {
-  console.log("Performance Optimizer — Deep Agent (Node.js)");
-  console.log(
-    "Usage: node agent.js 'optimize performance | verify: python -m pytest -v'"
-  );
+  console.log("Performance Optimizer — Karpathy-style iterative agent");
+  console.log("Usage: node agent.js 'optimize the code'");
   console.log("   Or pipe via Primordial NDJSON protocol.");
 } else {
   runPrimordial().catch((err) => {
