@@ -4,7 +4,7 @@ version: 0.3.0
 description: >
   Karpathy-style iterative coding agent. Conversational — answers questions
   about your code. When given a task (optimize, fix bugs, refactor, add features),
-  loops autonomously: edit → test → keep/revert → report → next. Works with any
+  loops autonomously: edit -> test -> keep/revert -> report -> next. Works with any
   language — auto-detects test runner and build system. Streams tool uses in real-time.
 category: coding
 tags: [coding, autonomous, testing, performance, refactoring, bugfix]
@@ -14,10 +14,15 @@ author:
 
 runtime:
   language: node
-  run_command: node bundle.mjs 2>/dev/null || node agent.js
+  run_command: node bundle.mjs 2>/dev/null || node src/agent.js
   setup_command: test -f bundle.mjs || npm install
   dependencies: package.json
+  default_model:
+    provider: anthropic
+    model: claude-sonnet-4-5-20250929
   resources:
+    max_memory: 2GB
+    max_cpu: 2
     max_time: "1h"
 
 permissions:
@@ -26,8 +31,12 @@ permissions:
   network:
     - domain: api.anthropic.com
       reason: LLM inference for code analysis and optimization
+  delegation:
+    enabled: false
 
 keys:
   - provider: anthropic
+    env_var: ANTHROPIC_API_KEY
     domain: api.anthropic.com
     auth_style: x-api-key
+    required: true
