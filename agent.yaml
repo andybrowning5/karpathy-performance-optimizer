@@ -1,0 +1,32 @@
+name: perf-optimizer
+display_name: Performance Optimizer
+version: 0.1.0
+description: >
+  Autonomous performance optimizer powered by LangChain Deep Agents (Node.js).
+  Reads code, identifies performance bottlenecks, implements optimizations,
+  validates with tests, and keeps improvements that pass.
+category: coding
+tags: [performance, optimization, autonomous, testing]
+author:
+  name: Andy Browning
+  github: andybrowning5
+
+runtime:
+  language: node
+  run_command: node agent.js
+  setup_command: npm install
+  dependencies: package.json
+  resources:
+    max_time: "1h"
+
+permissions:
+  filesystem:
+    workspace: readwrite
+  network:
+    - domain: api.anthropic.com
+      reason: LLM inference for code analysis and optimization
+
+keys:
+  - provider: anthropic
+    domain: api.anthropic.com
+    auth_style: x-api-key
