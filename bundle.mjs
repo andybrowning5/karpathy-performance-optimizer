@@ -10051,7 +10051,7 @@ import {
 } from "fs";
 import { join, resolve, dirname } from "path";
 var WORKSPACE = process.env.WORKSPACE || process.cwd();
-var MODEL = process.env.ANTHROPIC_MODEL || "claude-sonnet-4-5-20250929";
+var MODEL = process.env.ANTHROPIC_MODEL || "claude-sonnet-4-6";
 var anthropic = new sdk_default();
 function send(msg) {
   process.stdout.write(JSON.stringify(msg) + "\n");

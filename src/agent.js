@@ -21,7 +21,7 @@ import {
 import { join, resolve, dirname } from "path";
 
 const WORKSPACE = process.env.WORKSPACE || process.cwd();
-const MODEL = process.env.ANTHROPIC_MODEL || "claude-sonnet-4-5-20250929";
+const MODEL = process.env.ANTHROPIC_MODEL || "claude-sonnet-4-6";
 
 const anthropic = new Anthropic();
 
